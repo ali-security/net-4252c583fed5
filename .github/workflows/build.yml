@@ -1,0 +1,108 @@
+# Upstream golang.org/x/net has no GitHub Actions CI (it is developed on
+# Gerrit and tested by Go's own LUCI builders), so this workflow is authored
+# for the sealed build. It reproduces the module source zip that
+# proxy.golang.org serves and runs the project's own suite: `go build ./...`
+# and `go test ./...`.
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated Go test names to run; empty runs the full suite"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: false
+
+      - name: Download modules
+        run: go mod download
+
+      # The module zip is produced from a pristine copy of the tree, before any
+      # build or test byproducts exist. This workflow file is removed from that
+      # copy: upstream ships no .github/ at all, so leaving it in would add a
+      # member the published module zip does not have.
+      - name: Produce module zip
+        run: |
+          mkdir -p /tmp/modsrc /tmp/zipper
+          cp -a "$GITHUB_WORKSPACE/." /tmp/modsrc/
+          rm -rf /tmp/modsrc/.github
+          mkdir -p "$GITHUB_WORKSPACE/build_output"
+          cat > /tmp/zipper/main.go <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              if len(os.Args) != 5 {
+                  log.Fatal("usage: main <module-path> <version> <source-dir> <output-zip>")
+              }
+              m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+              f, err := os.Create(os.Args[4])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+                  log.Fatal(err)
+              }
+              log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          cd /tmp/zipper
+          go mod init sealzip
+          go get golang.org/x/mod@v0.28.0
+          go run . golang.org/x/net v0.45.0 /tmp/modsrc "$GITHUB_WORKSPACE/build_output/v0.45.0.zip"
+          unzip -Z1 "$GITHUB_WORKSPACE/build_output/v0.45.0.zip" | wc -l
+
+      - name: Build
+        run: go build ./...
+
+      # Full suite by default. A non-empty test-filter runs only the named
+      # tests; the per-name grep is fail-closed because `go test -run` exits 0
+      # when its pattern matches nothing.
+      - name: Test
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          # The default `run:` shell is `bash -e` without pipefail, so the
+          # `| tee` below would otherwise report tee's exit status and hide a
+          # failing `go test`.
+          set -o pipefail
+          if [ -n "$TEST_FILTER" ]; then
+            go test -v -run "^($(echo "$TEST_FILTER" | tr ' ' '|'))$" ./... 2>&1 | tee /tmp/scoped.log
+            for t in $TEST_FILTER; do
+              grep -qE "^=== RUN[[:space:]]+${t}(/|$)" /tmp/scoped.log || { echo "selected test $t never ran"; exit 1; }
+            done
+          else
+            go test ./...
+          fi
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: build_output/v0.45.0.zip
+          if-no-files-found: error
