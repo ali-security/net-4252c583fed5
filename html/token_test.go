@@ -626,6 +626,16 @@ var tokenTests = []tokenTest{
 		`<p a=/>`,
 		`<p a="/">`,
 	},
+	{
+		"duplicate attributes",
+		`<p foo="bar" foo="baz">`,
+		`<p foo="bar">`,
+	},
+	{
+		"duplicate attributes, different case",
+		`<p FOO="bar" foo="baz">`,
+		`<p foo="bar">`,
+	},
 }
 
 func TestTokenizer(t *testing.T) {
@@ -933,3 +943,163 @@ func benchmarkTokenizer(b *testing.B, level int) {
 func BenchmarkRawLevelTokenizer(b *testing.B)  { benchmarkTokenizer(b, rawLevel) }
 func BenchmarkLowLevelTokenizer(b *testing.B)  { benchmarkTokenizer(b, lowLevel) }
 func BenchmarkHighLevelTokenizer(b *testing.B) { benchmarkTokenizer(b, highLevel) }
+
+func TestUnicodeAttributeCase(t *testing.T) {
+	// <div a="1" A="1"> is resolved to <div a="1"> because a and A are considered
+	// duplicate attribute names. Different unicode cases are not considered equal
+	// though, so <div ä="1" Ä="1"> is tokenized as <div ä="1" Ä="1">.
+	f := `<div ä="1" Ä="1">`
+	z := NewTokenizer(strings.NewReader(f))
+	if tt := z.Next(); tt != StartTagToken {
+		t.Fatalf("expected StartTagToken, got %s", tt)
+	}
+	tok := z.Token()
+	if len(tok.Attr) != 2 {
+		t.Fatalf("expected 2 attributes, got %d", len(tok.Attr))
+	}
+	if tok.Attr[0].Key != "ä" {
+		t.Errorf("expected attribute key to be 'ä', got %s", tok.Attr[0].Key)
+	}
+	if tok.Attr[1].Key != "Ä" {
+		t.Errorf("expected attribute key to be 'Ä', got %s", tok.Attr[1].Key)
+	}
+}
+
+// TestDuplicateAttributesXSS is a regression test for CVE-2026-27136. A
+// duplicated attribute name used to survive tokenization, so a consumer that
+// folds the attributes into a map (last one wins) disagreed with a browser
+// (first one wins) about what the markup means, and a sanitizer built that way
+// could be talked into emitting an active URL or event handler. Per WHATWG
+// 13.2.5.33 every attribute whose name was already seen is dropped, so only the
+// first occurrence is ever reported.
+func TestDuplicateAttributesXSS(t *testing.T) {
+	tests := []struct {
+		desc     string
+		html     string
+		wantType TokenType
+		want     []Attribute
+	}{
+		{
+			"duplicate href, dangerous value first",
+			`<a href="javascript:alert(1)" href="https://example.com/">`,
+			StartTagToken,
+			[]Attribute{{Key: "href", Val: "javascript:alert(1)"}},
+		},
+		{
+			"duplicate href, dangerous value last",
+			`<a href="https://example.com/" href="javascript:alert(1)">`,
+			StartTagToken,
+			[]Attribute{{Key: "href", Val: "https://example.com/"}},
+		},
+		{
+			"duplicate event handler smuggled behind a differently cased name",
+			`<img src="x" ONERROR="" onerror="alert(1)">`,
+			StartTagToken,
+			[]Attribute{{Key: "src", Val: "x"}, {Key: "onerror", Val: ""}},
+		},
+		{
+			"three occurrences of the same attribute",
+			`<a href="#" href="javascript:alert(1)" href="javascript:alert(2)">`,
+			StartTagToken,
+			[]Attribute{{Key: "href", Val: "#"}},
+		},
+		{
+			"mixed case duplicates keep only the first",
+			`<div Id="a" iD="b" ID="c" id="d">`,
+			StartTagToken,
+			[]Attribute{{Key: "id", Val: "a"}},
+		},
+		{
+			"duplicate attribute with an unquoted value",
+			`<img src=x onerror=alert(1) onerror=alert(2)>`,
+			StartTagToken,
+			[]Attribute{{Key: "src", Val: "x"}, {Key: "onerror", Val: "alert(1)"}},
+		},
+		{
+			"duplicate event handler on a self-closing tag",
+			`<img src="x" onerror="0" ONERROR="alert(1)"/>`,
+			SelfClosingTagToken,
+			[]Attribute{{Key: "src", Val: "x"}, {Key: "onerror", Val: "0"}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.desc, func(t *testing.T) {
+			z := NewTokenizer(strings.NewReader(tt.html))
+			if got := z.Next(); got != tt.wantType {
+				t.Fatalf("Next() = %v, want %v", got, tt.wantType)
+			}
+			// Raw must still report the caller's bytes verbatim, original
+			// attribute-name casing included: the deduplication key is
+			// lower-cased on a copy, never in the tokenizer's own buffer.
+			if got := string(z.Raw()); got != tt.html {
+				t.Errorf("Raw() = %q, want %q", got, tt.html)
+			}
+			if got := z.Token().Attr; !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("Token().Attr = %v, want %v", got, tt.want)
+			}
+
+			// The same must hold after a parse/render round trip: a browser
+			// reading the rendered markup keeps the first occurrence, so
+			// re-rendering the duplicate would reintroduce the attack.
+			doc, err := Parse(strings.NewReader(tt.html))
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			var b bytes.Buffer
+			if err := Render(&b, doc); err != nil {
+				t.Fatalf("Render: %v", err)
+			}
+			reparsed, err := Parse(bytes.NewReader(b.Bytes()))
+			if err != nil {
+				t.Fatalf("Parse(rendered): %v", err)
+			}
+			for _, tree := range []*Node{doc, reparsed} {
+				for _, key := range []string{"href", "onerror", "id", "src"} {
+					if n := countAttrKey(tree, key); n > 1 {
+						t.Errorf("rendered %q has an element with %d %s attributes, want at most 1", b.String(), n, key)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestDuplicateAttributesAcrossTags checks that the set of seen attribute names
+// is reset for each tag, so a name used on one tag does not suppress the same
+// name on a later one.
+func TestDuplicateAttributesAcrossTags(t *testing.T) {
+	const in = `<a href="1" href="2"><b href="3"><c HREF="4" href="5">`
+	want := [][]Attribute{
+		{{Key: "href", Val: "1"}},
+		{{Key: "href", Val: "3"}},
+		{{Key: "href", Val: "4"}},
+	}
+	z := NewTokenizer(strings.NewReader(in))
+	for i, w := range want {
+		if got := z.Next(); got != StartTagToken {
+			t.Fatalf("token %d: Next() = %v, want StartTagToken", i, got)
+		}
+		if got := z.Token().Attr; !reflect.DeepEqual(got, w) {
+			t.Errorf("token %d: Token().Attr = %v, want %v", i, got, w)
+		}
+	}
+}
+
+// countAttrKey reports how many times key appears as an attribute name on any
+// single element in the tree rooted at n.
+func countAttrKey(n *Node, key string) int {
+	most := 0
+	if n.Type == ElementNode {
+		for _, a := range n.Attr {
+			if a.Key == key {
+				most++
+			}
+		}
+	}
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		if got := countAttrKey(c, key); got > most {
+			most = got
+		}
+	}
+	return most
+}
